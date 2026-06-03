@@ -1,0 +1,312 @@
+---
+title: "practicafinal"
+author: "Paula Griñán Fernandez"
+date: "curso 2025-2026"
+output: html_document
+---
+
+```{r, warning=FALSE, message=FALSE}
+library(sf)
+library(tidyverse)
+library(readxl)
+library(stringi)
+library(janitor)
+library(spdep)
+library(tmap)
+tmap_mode("plot")
+library(viridis)
+library(sjPlot)
+library(ggrepel)
+library(spatialreg)
+```
+
+```{r}
+# Función de normalización para evitar los NA 
+limpiar_todo <- function(texto) {
+  texto <- toupper(texto)
+  texto <- iconv(texto, to="ASCII//TRANSLIT") 
+  texto <- str_replace_all(texto, "[^[:alnum:]]", "") 
+  texto <- trimws(texto)
+  return(texto)
+}
+```
+
+```{r, message=FALSE, warning=FALSE}
+distritos <- st_read("distritos.shp") %>%
+  mutate(ID_UNIR = limpiar_todo(NOMBRE))
+
+farolas <- st_read("farolas.shp")
+
+comercio <- read.csv2("locales.csv", fileEncoding = "latin1") %>%
+  filter(desc_situacion_local == "Abierto") %>%
+  group_by(desc_distrito_local) %>%
+  summarise(n_locales = n()) %>%
+  mutate(ID_UNIR = limpiar_todo(desc_distrito_local))
+
+meses <- c("enero", "febrero", "marzo", "abril", "mayo", "junio", 
+           "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre")
+
+datos_lista <- map(meses, function(mes) {
+  read_excel(paste0(mes, ".xlsx"), sheet = "SEGURIDAD", skip = 2) %>%
+    select(DISTRITO = 1, PERS = 2, PATRI = 3) %>% 
+    filter(!is.na(DISTRITO), !str_detect(DISTRITO, "(?i)TOTAL|DISTRITO")) %>%
+    mutate(
+      DISTRITO = str_replace(DISTRITO, "^[0-9]{2}\\. ", ""),
+      across(c(PERS, PATRI), ~as.numeric(.))
+    )
+})
+
+dataset_anual <- datos_lista %>%
+  bind_rows() %>% 
+  group_by(DISTRITO) %>%
+  summarise(
+    ANUAL_PERSONAS = sum(PERS, na.rm = TRUE),
+    ANUAL_PATRIMONIO = sum(PATRI, na.rm = TRUE),
+    TOTAL_GLOBAL = ANUAL_PERSONAS + ANUAL_PATRIMONIO
+  ) %>%
+  mutate(ID_UNIR = limpiar_todo(DISTRITO))
+
+```
+
+ANÁLISIS GEOESPACIAL
+
+```{r, warning=FALSE, message=FALSE}
+# Contar farolas por distrito
+distritos$num_farolas <- lengths(st_intersects(distritos, farolas))
+
+# Unión de todas las fuentes de datos
+madrid_completo <- distritos %>%
+  left_join(dataset_anual, by = "ID_UNIR") %>%
+  left_join(comercio, by = "ID_UNIR")
+
+# TRANSFORMACIÓN A DENSIDADES Y CATEGORIZACIÓN
+madrid_completo <- madrid_completo %>%
+  mutate(
+    area_km2 = as.numeric(st_area(geometry)) / 1e6,
+    densidad_delitos = TOTAL_GLOBAL / area_km2,
+    densidad_farolas = num_farolas / area_km2,
+    densidad_comercial = n_locales / area_km2
+  ) %>%
+  mutate(rango_delitos = cut(densidad_delitos, 
+                             breaks = quantile(densidad_delitos, probs = seq(0, 1, 0.2), na.rm = TRUE),
+                             labels = c("Muy Bajo", "Bajo", "Medio", "Alto", "Muy Alto"),
+                             include.lowest = TRUE))
+
+ggplot(madrid_completo) +
+  geom_sf(aes(fill = densidad_delitos), color = "white", size = 0.1) +
+  scale_fill_viridis_c(option = "magma", direction = -1) + 
+  
+  labs(
+    title = "Figura 1: Concentración de Delitos en Madrid",
+    subtitle = "Delitos por kilómetro cuadrado (Densidad)",
+    fill = "Delitos / km2", # Etiqueta clara de lo que mide
+    caption = "Fuente: Elaboración propia a partir de datos del Ayuntamiento de Madrid"
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10)
+  )
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+ggplot(madrid_completo, aes(x = densidad_farolas, y = densidad_delitos)) +
+  geom_point(color = "steelblue", size = 3, alpha = 0.7) +
+  geom_smooth(method = "lm", color = "firebrick", se = TRUE) + 
+  labs(
+    title = "Figura 3:Relación entre Alumbrado Público y Delitos",
+    subtitle = "Análisis por densidad en los distritos de Madrid",
+    x = "Densidad de Farolas (unidades / km2)",
+    y = "Densidad de Delitos (delitos / km2)",
+    caption = "Fuente: elaboración propia a partir de los datos"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(size = 11)
+  )
+```
+
+
+
+HIPÓTESIS 1: "¿A MÁS LUZ, MENOS DELITOS?" 
+
+
+```{r}
+ggplot(madrid_completo, aes(x = densidad_delitos)) +
+  geom_density(fill = "#3182bd", alpha = 0.5, color = "#08519c") +
+  geom_rug(alpha = 0.8) +
+  geom_vline(aes(xintercept = mean(densidad_delitos, na.rm = TRUE)), 
+             color = "red", linetype = "dashed", size = 1) +
+  annotate("text", x = mean(madrid_completo$densidad_delitos, na.rm = TRUE), 
+           y = 0, label = "Media", vjust = -1, color = "red") +
+  labs(
+    title = "Figura 2: Distribución de la Densidad de Delitos en Madrid",
+    x = "Delitos por km²",
+    y = "Densidad de Probabilidad",
+    caption = "Fuente: elaboración propia a partir de los datos"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+modelo_simple <- lm(densidad_delitos ~ densidad_farolas, data = madrid_completo)
+summary(modelo_simple)
+```
+```{r}
+madrid_completo$residuos <- residuals(modelo_simple)
+
+madrid_completo %>% 
+  st_drop_geometry() %>%
+  select(DISTRITO, densidad_delitos, residuos) %>%
+  arrange(desc(residuos)) %>%
+  head(3)
+```
+
+
+¿DÓNDE SE CONCENTRAN REALMENTE LOS DELITOS?
+
+```{r}
+# 1. Crear la matriz de pesos espaciales
+nb <- poly2nb(madrid_completo, queen = TRUE)
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# 2. Calcular el Índice de Moran Local
+lisa <- localmoran(madrid_completo$densidad_delitos, lw, zero.policy = TRUE)
+
+# 3. Preparar los cuadrantes (Estandarización manual para evitar errores de matriz)
+# Usamos drop() para convertir la matriz de scale() en un vector numérico simple
+z_delitos <- drop(scale(madrid_completo$densidad_delitos))
+lag_z_delitos <- drop(scale(lag.listw(lw, z_delitos, zero.policy = TRUE)))
+p_valor <- lisa[, 5]
+
+# 4. Asignar categorías de clúster
+madrid_completo$lisa_quad <- "No Significativo"
+
+madrid_completo$lisa_quad[p_valor < 0.05 & z_delitos > 0 & lag_z_delitos > 0] <- "Alto-Alto"
+madrid_completo$lisa_quad[p_valor < 0.05 & z_delitos < 0 & lag_z_delitos < 0] <- "Bajo-Bajo"
+madrid_completo$lisa_quad[p_valor < 0.05 & z_delitos > 0 & lag_z_delitos < 0] <- "Alto-Bajo"
+madrid_completo$lisa_quad[p_valor < 0.05 & z_delitos < 0 & lag_z_delitos > 0] <- "Bajo-Alto"
+
+# Convertir a factor para asegurar el orden en la leyenda
+madrid_completo$lisa_quad <- factor(madrid_completo$lisa_quad, 
+                                    levels = c("Alto-Alto", "Bajo-Bajo", 
+                                               "Alto-Bajo", "Bajo-Alto", 
+                                               "No Significativo"))
+
+mapa_lisa <- tm_shape(madrid_completo) +
+  tm_polygons("lisa_quad", 
+              palette = c("Alto-Alto" = "#d73027",    
+                          "Bajo-Bajo" = "#4575b4",   
+                          "Alto-Bajo" = "#f4a582",    
+                          "Bajo-Alto" = "#abd9e9",   
+                          "No Significativo" = "#eeeeee"),      
+              title = "Clústeres LISA") +
+  tm_layout(main.title = "Figuar 4: Análisis de Puntos Calientes (LISA)",
+            main.title.size = 1.2,
+            frame = FALSE, 
+            legend.outside = TRUE,
+            legend.title.size = 1)
+
+mapa_lisa
+```
+
+HIPÓTESIS 2: LA EXPLICACIÓN ECONÓMICA
+
+Planteamos que el centro tiene más delitos porque allí confluyen luz Y comercios (oportunidad)
+
+```{r}
+#install.packages("ggrepel")
+
+figura_5 <- ggplot(madrid_completo, aes(x = densidad_farolas, y = densidad_delitos)) +
+  geom_point(aes(size = densidad_comercial, color = densidad_comercial), alpha = 0.6) +
+  geom_smooth(method = "lm", color = "firebrick", linetype = "solid", se = TRUE, size = 0.5) +
+  geom_text_repel(aes(label = ifelse(densidad_delitos > 100 | densidad_comercial > 400, DISTRITO, "")),
+                  size = 3, fontface = "bold", box.padding = 0.5) +
+  scale_color_viridis_c(option = "mako", name = "Locales / Km²") +
+  scale_size_continuous(name = "Densidad Comercial") +
+  labs(
+    title = "Figura 5: Coexistencia de Infraestructura, Comercio y Delito",
+    x = "Densidad de Farolas (unidades/km²)", 
+    y = "Densidad de Delitos (delitos/km²)",
+    caption = "Fuente: elaboración propia a partir de los datos obtenidos"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right", plot.title = element_text(face = "bold"))
+
+figura_5
+```
+
+```{r}
+# modelo de regresión múltiple para ver si la luz sigue siendo importante cuando "controlamos" por el comercio
+modelo_multiple <- lm(densidad_delitos ~ densidad_farolas + densidad_comercial, 
+                      data = madrid_completo)
+summary(modelo_multiple)
+
+if(!require(lm.beta)) install.packages("lm.beta")
+library(lm.beta)
+
+print(lm.beta(modelo_multiple))
+```
+```{r}
+modelo_interaccion <- lm(densidad_delitos ~ densidad_farolas * densidad_comercial, data = madrid_completo)
+
+summary(modelo_interaccion)
+```
+```{r}
+data.frame(
+  Modelo = c("Simple (Luz)", "Múltiple (Luz + Comercio)", "Interacción (Luz x Comercio)"),
+  R_Cuadrado_Adj = c(summary(modelo_simple)$adj.r.squared,
+                     summary(modelo_multiple)$adj.r.squared,
+                     summary(modelo_interaccion)$adj.r.squared)
+)
+```
+
+```{r}
+
+nb <- poly2nb(madrid_completo, queen = TRUE)
+pesos <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+diagnostico <- lm.LMtests(modelo_interaccion, pesos, test = "all")
+print(diagnostico) 
+
+modelo_sar <- lagsarlm(densidad_delitos ~ densidad_farolas * densidad_comercial, 
+                       data = madrid_completo, listw = pesos, zero.policy = TRUE)
+
+metro <- read.csv("stops.txt", sep = ",")
+estaciones_sf <- st_as_sf(metro, coords = c("stop_lon", "stop_lat"), crs = 4326)
+madrid_geo <- st_transform(madrid_completo, 4326) 
+
+conteo <- st_join(estaciones_sf, madrid_geo) %>%
+  group_by(ID_UNIR) %>%
+  summarise(n_metro = n()) %>%
+  st_drop_geometry()
+
+madrid_completo <- madrid_completo %>%
+  left_join(conteo, by = "ID_UNIR") %>%
+  mutate(
+    n_metro = replace_na(n_metro, 0),
+    densidad_metro = n_metro / area_km2
+  )
+
+# MODELO FINAL 
+modelo_final_conmetro <- lm(densidad_delitos ~ densidad_farolas * densidad_comercial + densidad_metro, 
+                            data = madrid_completo)
+summary(modelo_final_conmetro)
+```
+```{r}
+
+plot_model(modelo_interaccion, 
+           type = "int", 
+           title = "Figura 6: El Efecto Multiplicador: Luz y Comercio",
+           caption = "Fuente: elaboración propia a partir de los datos obtenidos",
+           axis.title = c("Densidad de Farolas (Infraestructura)", "Densidad de Delitos (Incidencia)"),
+           legend.title = "Actividad Comercial",
+           mdl.term = "densidad_farolas") + # Centramos el foco en las farolas
+  theme_minimal() +
+  scale_color_viridis_d(option = "viridis", labels = c("Baja", "Media", "Alta"))
+```
+
