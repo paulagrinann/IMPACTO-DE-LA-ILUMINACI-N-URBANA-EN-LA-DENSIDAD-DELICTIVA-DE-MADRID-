@@ -6,6 +6,7 @@ output: html_document
 ---
 
 ```{r, warning=FALSE, message=FALSE}
+set.seed(12345)
 library(sf)
 library(tidyverse)
 library(readxl)
@@ -170,20 +171,15 @@ madrid_completo %>%
 ¿DÓNDE SE CONCENTRAN REALMENTE LOS DELITOS?
 
 ```{r}
-# 1. Crear la matriz de pesos espaciales
 nb <- poly2nb(madrid_completo, queen = TRUE)
 lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
 
-# 2. Calcular el Índice de Moran Local
 lisa <- localmoran(madrid_completo$densidad_delitos, lw, zero.policy = TRUE)
 
-# 3. Preparar los cuadrantes (Estandarización manual para evitar errores de matriz)
-# Usamos drop() para convertir la matriz de scale() en un vector numérico simple
 z_delitos <- drop(scale(madrid_completo$densidad_delitos))
 lag_z_delitos <- drop(scale(lag.listw(lw, z_delitos, zero.policy = TRUE)))
 p_valor <- lisa[, 5]
 
-# 4. Asignar categorías de clúster
 madrid_completo$lisa_quad <- "No Significativo"
 
 madrid_completo$lisa_quad[p_valor < 0.05 & z_delitos > 0 & lag_z_delitos > 0] <- "Alto-Alto"
@@ -191,7 +187,6 @@ madrid_completo$lisa_quad[p_valor < 0.05 & z_delitos < 0 & lag_z_delitos < 0] <-
 madrid_completo$lisa_quad[p_valor < 0.05 & z_delitos > 0 & lag_z_delitos < 0] <- "Alto-Bajo"
 madrid_completo$lisa_quad[p_valor < 0.05 & z_delitos < 0 & lag_z_delitos > 0] <- "Bajo-Alto"
 
-# Convertir a factor para asegurar el orden en la leyenda
 madrid_completo$lisa_quad <- factor(madrid_completo$lisa_quad, 
                                     levels = c("Alto-Alto", "Bajo-Bajo", 
                                                "Alto-Bajo", "Bajo-Alto", 
@@ -305,7 +300,7 @@ plot_model(modelo_interaccion,
            caption = "Fuente: elaboración propia a partir de los datos obtenidos",
            axis.title = c("Densidad de Farolas (Infraestructura)", "Densidad de Delitos (Incidencia)"),
            legend.title = "Actividad Comercial",
-           mdl.term = "densidad_farolas") + # Centramos el foco en las farolas
+           mdl.term = "densidad_farolas") + 
   theme_minimal() +
   scale_color_viridis_d(option = "viridis", labels = c("Baja", "Media", "Alta"))
 ```
